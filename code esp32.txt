@@ -1,0 +1,268 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_AHTX0.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Fonts/FreeSerif9pt7b.h>
+
+#include <ArduinoJson.h>
+
+// Khai bao chan  ============
+#define hn_pin 34    // cam bien hong ngoai
+#define as_pin 5    // cam bien anh sang
+#define trigPin 18  //
+#define echoPin 19  // cam bien sieu am
+#define dt_pin 14    // chan dao trung
+#define bz_pin 23   // chan phat ra am thanh coi
+
+// WiFi
+const char *ssid = "Mr Muoi";       // Enter your Wi-Fi name
+const char *password = "88888888";  // Enter Wi-Fi password
+
+// MQTT Broker
+const char *mqtt_broker = "192.168.1.59";
+const char *mqtt_username = "emqx";
+const char *mqtt_password = "public";
+const int mqtt_port = 1883;
+
+// Khai bao thoi gian
+uint32_t time_aht10 = 0;
+uint32_t time_hn = 0;      // cam bien hong ngoai
+uint32_t time_kc = 0;      // Cam bien sieu am: kc = Khoang cach
+uint32_t time_as = 0;      // cam bien anh sang: as = anh sang
+uint32_t time_ck = 60000;  // Thoi gian chu ki ap trung = 60s;
+int time_dt = 15000;       // thoi gian dao trung: dt = dao trung = 15s
+uint32_t time_cur_dt = 0;  // thoi gian hien tai cua dong co dao trung
+uint32_t time_cur_bz = 0;  // thoi gian hien tai cua coi buzzer
+int time_bz = 200;         // thoi gian coi buzzer keu
+
+// Khai bao trang thai
+bool state_dt = false;  // trang thai cua dong co dao trung la false = khong bat
+bool state_bz = false;  // trang thai cua coi buzzer la fasle = khong bat
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+Adafruit_AHTX0 aht;
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+String client_id = "may_1";  // Ten_may
+// Tao topic subcribe
+String string_dt_btn = client_id + "/motor-btn";  // day la topic cho phep bat - tat dong co: dt = dao trung
+
+// Tao topic public
+String string_aht10 = client_id + "/aht-10";
+String string_hcsr04 = client_id + "/hc-sr04";
+String string_motor = client_id + "/motor";
+
+// Dang ki topic subcribe
+const char *topic_dt_btn = string_dt_btn.c_str();  // Chuyển đổi thành const char*
+
+// Dang ki topic public
+const char *topic_aht10 = string_aht10.c_str();
+const char *topic_hcsr04 = string_hcsr04.c_str();
+const char *topic_motor = string_motor.c_str();
+
+void readAht10() {
+  if (millis() - time_aht10 >= 2000) {
+    sensors_event_t humidity, temperature;
+    aht.getEvent(&humidity, &temperature);
+
+    if (isnan(humidity.relative_humidity) || isnan(temperature.temperature)) {
+      Serial.println("Failed to read from AHT10 sensor!");
+      return;
+    }
+    float nhietDo = temperature.temperature;
+    float doAm = humidity.relative_humidity;
+    writeScreenAht10(nhietDo, doAm);
+
+    // chuyen du lieu qua json
+    StaticJsonDocument<100> jsonDoc;
+    jsonDoc["temp"] = nhietDo;
+    jsonDoc["humidity"] = doAm;
+
+    char buffer[100];                // Đủ lớn để chứa chuỗi JSON
+    serializeJson(jsonDoc, buffer);  // Chuyển đổi JSON thành chuỗi
+    client.publish(topic_aht10, buffer);
+    time_aht10 = millis();
+  }
+}
+
+void buzzer_on() {
+  time_cur_bz = millis();
+}
+void buzzer() {
+  uint32_t now_time = millis();
+  if (now_time - time_cur_bz >= time_bz && state_bz == true) {
+    state_bz = false;
+    digitalWrite(bz_pin, LOW);
+  } else if (now_time - time_cur_bz < time_bz && state_bz == false) {
+    state_bz = true;
+    digitalWrite(bz_pin, HIGH);
+  }
+}
+
+void daoTrung() {
+  uint32_t now_time = millis();
+  // dieu kien de in ra chu "DAO TRUNG"
+  if (state_dt) {
+    display.setCursor(15, 15);
+    display.println("DAO TRUNG");
+    display.display();
+  }
+
+  if (now_time - time_dt - time_cur_dt >= time_ck && state_dt == true) {
+    digitalWrite(dt_pin, LOW);
+    state_dt = false;
+    time_cur_dt = millis();
+  } else if (now_time - time_cur_dt >= time_ck && state_dt == false) {
+    digitalWrite(dt_pin, HIGH);
+    state_dt = true;
+
+    // bat coi len
+    buzzer_on();
+  }
+}
+// Ham goi dao trung
+void dt_on() {
+  time_cur_dt = millis() - time_ck;  // dao trung
+  state_dt = false;
+}
+void dt_off() {
+  time_cur_dt = millis() - time_ck - time_dt;  // tat dao trung
+  state_dt = true;
+}
+
+void readKhoangCach() {
+  if (millis() - time_kc >= 2000) {
+    long duration, distance;
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+
+    duration = pulseIn(echoPin, HIGH);
+
+    distance = (duration * 0.034) / 2;  // Tính khoảng cách
+    Serial.print("Khoang cach - sieu am: ");
+    Serial.print(distance);
+    Serial.println(" cm");
+    time_kc = millis();
+  }
+}
+
+void readAnhSang() {
+  if (millis() - time_as >= 1000) {
+    int cb_as = digitalRead(as_pin);
+    Serial.print("Anh sang: ");
+    Serial.println(cb_as);
+    time_as = millis();
+  }
+}
+
+void readHongNgoai() {
+  if (millis() - time_hn >= 1000) {
+    int hn_analog = analogRead(hn_pin);
+    Serial.print("Hong ngoai: ");
+    Serial.println(hn_analog);
+    time_hn = millis();
+  }
+}
+void writeScreenAht10(float nhiet, float am) {
+  display.clearDisplay();
+  // nhiet
+  display.setCursor(0, 30);
+  display.println("Nhiet:");
+  display.setCursor(50, 30);
+  display.println(nhiet);
+
+  // am
+  display.setCursor(0, 50);
+  display.println("Am:");
+  display.setCursor(50, 50);
+  display.println(am);
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  // == wifi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.println("Connecting to WiFi..");
+  }
+  Serial.println("Connected to the Wi-Fi network");
+
+  // == MQTT
+  client.setServer(mqtt_broker, mqtt_port);
+  client.setCallback(callback);
+  while (!client.connected()) {
+    client_id += String(WiFi.macAddress());
+    Serial.printf("The client %s connects to the public MQTT broker\n", client_id.c_str());
+    if (client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
+      Serial.println("Public EMQX MQTT broker connected");
+    } else {
+      Serial.print("failed with state ");
+      Serial.print(client.state());
+      delay(2000);
+    }
+  }
+
+  // == Cau hinh cho thiet bi
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    for (;;)
+      ;
+  }
+  display.setFont(&FreeSerif9pt7b);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  if (!aht.begin()) {
+    Serial.println("Could not find AHT10 sensor!");
+    while (1)
+      ;
+  }
+
+  // Khai bao chan input ======
+  pinMode(hn_pin, INPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(as_pin, INPUT);
+
+  // Khai bao chan output
+  pinMode(trigPin, OUTPUT);
+  pinMode(dt_pin, OUTPUT);
+  pinMode(bz_pin, OUTPUT);
+
+  // subscribe
+  client.subscribe(topic_dt_btn);
+
+  // bat coi len bao hoan tat setup
+  buzzer_on();
+}
+
+void callback(char *topic, byte *payload, unsigned int length) {
+  if (String(topic) == string_dt_btn) {
+    if (payload[0] == '0'){
+      dt_off();
+    } else if (payload[0] == '1'){
+      dt_on();
+    }
+  }
+}
+
+void loop() {
+  readAnhSang();
+  readHongNgoai();
+  readAht10();
+  readKhoangCach();
+  daoTrung();
+  buzzer();
+  client.loop();
+}
